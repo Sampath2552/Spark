@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  spark:
+    image: pyspark-sftp
+    container_name: spark_workspace
+    working_dir: /app
+    stdin_open: true    # keep STDIN open for interactive shell
+    tty: true           # allocate a TTY so you can interact
+    volumes:
+      - .:/app          # mount your scripts (and jars)
+    ports:
+      - "4040:4040"     # Spark UI
+    entrypoint: ["/bin/bash"]
