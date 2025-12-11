@@ -1,0 +1,145 @@
+#!/bin/bash
+
+# Usage:
+# ./count_hdfs_lines_color_gz.sh <yyyy-mm-dd> <log_file> <parallel_jobs> <pattern1> <pattern2> ...
+#
+# Example:
+# ./count_hdfs_lines_color_gz.sh 2025-01-10 output.log 10 "BOR*" "INV*" "GLCC*"
+
+DATE="$1"
+LOG_FILE="$2"
+JOBS="$3"
+shift 3    # Remaining args = patterns
+
+if [ -z "$DATE" ] || [ -z "$LOG_FILE" ] || [ -z "$JOBS" ] || [ -z "$1" ]; then
+  echo "Usage: $0 <date> <log_file> <parallel_jobs> <pattern1> <pattern2> ..."
+  exit 1
+fi
+
+HDFS_DIR="/CBS-FILES/$DATE/BANCS24"
+
+echo "LOG START: $(date)" > "$LOG_FILE"
+echo "HDFS Directory: $HDFS_DIR" >> "$LOG_FILE"
+echo "Patterns: $@" >> "$LOG_FILE"
+echo "----------------------------------------" >> "$LOG_FILE"
+
+FILES=""
+declare -A pattern_totals
+
+# Initialize pattern totals
+for pattern in "$@"; do
+  pattern_totals["$pattern"]=0
+done
+
+# -------- FIND MATCHING FILES (ONLY .gz) -------- #
+for pattern in "$@"; do
+  MATCHED=$(hdfs dfs -ls "$HDFS_DIR" 2>/dev/null \
+            | awk '{print $8}' \
+            | grep -E "^.*/$pattern" \
+            | grep -E "\.gz$")     # << ONLY .gz FILES
+  FILES="$FILES
+$MATCHED"
+done
+
+FILES=$(echo "$FILES" | grep .)
+
+if [ -z "$FILES" ]; then
+  echo "No .gz files found in: $HDFS_DIR" >> "$LOG_FILE"
+  echo "No .gz files found. Exiting."
+  exit 2
+fi
+
+echo "Files found:" >> "$LOG_FILE"
+echo "$FILES" >> "$LOG_FILE"
+echo "----------------------------------------" >> "$LOG_FILE"
+
+# Save file list temporarily
+TEMP_LIST=$(mktemp)
+echo "$FILES" > "$TEMP_LIST"
+
+TOTAL_FILES=$(wc -l < "$TEMP_LIST")
+CURRENT=0
+
+# -------- COLOR PROGRESS BAR -------- #
+progress_bar() {
+  local current=$1
+  local total=$2
+  local width=40
+
+  local percent=$(( 100 * current / total ))
+  local filled=$(( width * current / total ))
+  local empty=$(( width - filled ))
+
+  GREEN="\e[42m \e[0m"
+  YELLOW="\e[43m \e[0m"
+  GREY="\e[47m \e[0m"
+
+  printf "\r["
+
+  for i in $(seq 1 $filled); do printf "$GREEN"; done
+  if (( filled < width )); then
+    printf "$YELLOW"
+    empty=$((empty - 1))
+  fi
+  for i in $(seq 1 $empty); do printf "$GREY"; done
+
+  printf "] %d%% (%d/%d)" "$percent" "$current" "$total"
+}
+
+# -------- LINE COUNT FUNCTION -------- #
+process_file() {
+  file="$1"
+  count=$(hdfs dfs -text "$file" 2>/dev/null | wc -l)
+  echo "$file,$count"
+}
+
+export -f process_file
+
+RESULTS_FILE=$(mktemp)
+
+# -------- PARALLEL PROCESSING + PROGRESS -------- #
+while IFS= read -r file; do
+  (
+    result=$(process_file "$file")
+    echo "$result" >> "$RESULTS_FILE"
+  ) &
+
+  while (( $(jobs -r | wc -l) >= JOBS )); do sleep 0.1; done
+
+  CURRENT=$((CURRENT + 1))
+  progress_bar $CURRENT $TOTAL_FILES
+
+done < "$TEMP_LIST"
+
+wait
+echo ""
+
+# -------- TOTALS CALCULATION -------- #
+total_lines=0
+
+while IFS=',' read -r file count; do
+  echo "File: $file Lines: $count" >> "$LOG_FILE"
+  total_lines=$((total_lines + count))
+
+  for pattern in "$@"; do
+    base="${pattern/\*/}"
+    if [[ "$file" == *"$base"* ]]; then
+      pattern_totals["$pattern"]=$(( pattern_totals["$pattern"] + count ))
+    fi
+  done
+
+done <<< "$(cat "$RESULTS_FILE")"
+
+echo "----------------------------------------" >> "$LOG_FILE"
+echo "TOTAL LINES ACROSS ALL FILES: $total_lines" >> "$LOG_FILE"
+echo "----------------------------------------" >> "$LOG_FILE"
+
+echo "PATTERN TOTALS:" >> "$LOG_FILE"
+for pattern in "$@"; do
+  echo "$pattern = ${pattern_totals[$pattern]} lines" >> "$LOG_FILE"
+done
+
+echo "LOG END: $(date)" >> "$LOG_FILE"
+
+echo ""
+echo "✔ DONE — results saved to: $LOG_FILE"
