@@ -1,0 +1,93 @@
+#!/bin/bash
+
+# Usage:
+# ./count_hdfs_lines.sh <date: yyyy-mm-dd> <log_file> <parallel_jobs> <pattern1> <pattern2> ...
+#
+# Example:
+# ./count_hdfs_lines.sh 2025-01-10 output.log 10 "BOR*" "INV*" "GLCC*"
+
+DATE="$1"
+LOG_FILE="$2"
+JOBS="$3"
+shift 3   # remaining args = patterns
+
+if [ -z "$DATE" ] || [ -z "$LOG_FILE" ] || [ -z "$JOBS" ] || [ -z "$1" ]; then
+  echo "Usage: $0 <date> <log_file> <parallel_jobs> <pattern1> <pattern2> ..."
+  exit 1
+fi
+
+HDFS_DIR="/CBS-FILES/$DATE/BANCS24"
+
+echo "LOG START: $(date)" > "$LOG_FILE"
+echo "HDFS Directory: $HDFS_DIR" >> "$LOG_FILE"
+echo "Patterns: $@" >> "$LOG_FILE"
+echo "------------------------------------------" >> "$LOG_FILE"
+
+FILES=""
+declare -A pattern_totals
+
+# Initialize per-pattern counters
+for pattern in "$@"; do
+  pattern_totals["$pattern"]=0
+done
+
+# Collect matching files (duplicates kept)
+for pattern in "$@"; do
+  MATCHED=$(hdfs dfs -ls "$HDFS_DIR" 2>/dev/null | awk '{print $8}' | grep -E "^.*/$pattern")
+  FILES="$FILES $MATCHED"
+done
+
+if [ -z "$FILES" ]; then
+  echo "No files found in: $HDFS_DIR" >> "$LOG_FILE"
+  echo "No matching files. Exiting."
+  exit 2
+fi
+
+echo "Files found:" >> "$LOG_FILE"
+echo "$FILES" >> "$LOG_FILE"
+echo "------------------------------------------" >> "$LOG_FILE"
+
+# Save file list
+TEMP_LIST=$(mktemp)
+echo "$FILES" | tr ' ' '\n' | grep . > "$TEMP_LIST"
+
+# Function to read HDFS and count lines
+process_file() {
+  file="$1"
+  lines=$(hdfs dfs -text "$file" 2>/dev/null | wc -l)
+  echo "$file,$lines"
+}
+
+export -f process_file
+
+# Run parallel jobs
+RESULTS=$(cat "$TEMP_LIST" | xargs -I {} -P "$JOBS" bash -c 'process_file "$@"' _ {})
+
+total_lines=0
+
+# Parse results + accumulate totals
+echo "$RESULTS" | while IFS=',' read -r file count; do
+  echo "File: $file Lines: $count" >> "$LOG_FILE"
+  total_lines=$((total_lines + count))
+
+  # Pattern grouping (BOR*, INV*, GLCC*)
+  for pattern in "$@"; do
+    base="${pattern/\*/}"  
+    if [[ "$file" == *"$base"* ]]; then
+      pattern_totals["$pattern"]=$((pattern_totals["$pattern"] + count))
+    fi
+  done
+done
+
+echo "------------------------------------------" >> "$LOG_FILE"
+echo "TOTAL LINES ACROSS ALL FILES: $total_lines" >> "$LOG_FILE"
+echo "------------------------------------------" >> "$LOG_FILE"
+echo "PATTERN TOTALS:" >> "$LOG_FILE"
+
+for pattern in "${!pattern_totals[@]}"; do
+  echo "$pattern = ${pattern_totals[$pattern]} lines" >> "$LOG_FILE"
+done
+
+echo "LOG END: $(date)" >> "$LOG_FILE"
+
+echo "Processing complete. Output saved in: $LOG_FILE"
