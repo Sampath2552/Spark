@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  spark:
+    image: apache/spark:3.5.7
+    container_name: spark-3.5.7
+    hostname: spark
+    volumes:
+      - ./hadoop/conf:/opt/spark/conf
+      - ./jars:/opt/spark/jars
+    environment:
+      - SPARK_MODE=driver
+      - HADOOP_CONF_DIR=/opt/spark/conf
+    command: >
+      bash -c "
+      spark-shell
+      "
