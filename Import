@@ -1,0 +1,7 @@
+hdfs dfs -ls /data-lake | awk '{print $8}' | while read d
+do
+  if hdfs dfs -test -d "$d/_delta_log"; then
+    t=$(basename "$d")
+    echo "CALL delta.register_table(schema_name => 'default', table_name => '$t', table_location => 'hdfs://10.177.103.199:8020$d');"
+  fi
+done > register_all.sql
