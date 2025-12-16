@@ -1,0 +1,76 @@
+import io.delta.standalone.*;
+import io.delta.standalone.data.*;
+import io.delta.standalone.expressions.Expression;
+import io.delta.standalone.types.*;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.parquet.hadoop.ParquetReader;
+import org.apache.parquet.hadoop.util.HadoopInputFile;
+import org.apache.parquet.io.ColumnIOFactory;
+import org.apache.parquet.io.MessageColumnIO;
+import org.apache.parquet.schema.MessageType;
+import org.apache.parquet.schema.MessageTypeParser;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Configuration
+@Service
+public class DeltaLakeService {
+    
+    private final Configuration hadoopConf;
+    
+    public DeltaLakeService() {
+        this.hadoopConf = new Configuration();
+        // Automatically loads core-site.xml and hdfs-site.xml from classpath
+    }
+    
+    public List<RowRecord> readDeltaTable(String tablePath) throws IOException {
+        Path path = new Path(tablePath); // "hdfs://namenode:8020/your/delta/table"
+        DeltaLog deltaLog = DeltaLog.forTable(hadoopConf, path);
+        Snapshot snapshot = deltaLog.snapshot(); // Latest snapshot
+        
+        // Optional: Add partition predicate e.g., "partition_col = 'value'"
+        ScanConfig scanConfig = ScanConfig.builder()
+            .withReadSchema(getSchema(snapshot)) // Read specific schema
+            .build();
+        
+        Scan scan = snapshot.scan(scanConfig);
+        List<FileAction> files = scan.getAllFiles();
+        
+        // Read all Parquet files
+        List<RowRecord> allRows = files.stream()
+            .filter(FileAction::isAddFile)
+            .map(AddFile.class::cast)
+            .flatMap(this::readParquetFile)
+            .collect(Collectors.toList());
+            
+        return allRows;
+    }
+    
+    private Stream<RowRecord> readParquetFile(AddFile addFile) {
+        try {
+            Path parquetPath = new Path(addFile.path());
+            org.apache.hadoop.fs.FileSystem fs = hadoopConf.getClassByName("org.apache.hadoop.hdfs.DistributedFileSystem");
+            org.apache.hadoop.fs.Path hadoopPath = new org.apache.hadoop.fs.Path(parquetPath.toString());
+            
+            MessageType parquetSchema = MessageTypeParser.parseMessageType(
+                HadoopInputFile.fromPath(hadoopPath, hadoopConf).getFileMetaData().getSchema());
+            
+            ParquetReader<RowRecord> reader = ParquetReader.builder(new DeltaRowReadSupport())
+                .enableDecryption()
+                .withConf(hadoopConf)
+                .withFileName(parquetPath.toString())
+                .build();
+                
+            return StreamSupport.stream(reader.spliterator(), false);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to read Parquet file: " + addFile.path(), e);
+        }
+    }
+    
+    private StructType getSchema(Snapshot snapshot) {
+        return snapshot.getMetadata().schema();
+    }
+}
