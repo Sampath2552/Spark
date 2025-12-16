@@ -1,0 +1,60 @@
+package com.fincone.reportstructureservice.service;
+
+import io.delta.kernel.Snapshot;
+import io.delta.kernel.Table;
+import io.delta.kernel.client.TableClient;
+import io.delta.kernel.defaults.engine.DefaultEngine;
+import io.delta.kernel.engine.Engine;
+import io.delta.kernel.internal.TableImpl;
+import io.delta.kernel.data.ColumnarBatch;
+import io.delta.kernel.expressions.Predicate;
+import io.delta.kernel.Scan;
+import io.delta.kernel.ScanBuilder;
+
+import org.apache.hadoop.conf.Configuration;
+import org.springframework.stereotype.Service;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+
+@Service
+public class DeltaLakeService {
+
+    private final Engine engine;
+
+    public DeltaLakeService() {
+        Configuration hadoopConf = new Configuration();      // core-site.xml + hdfs-site.xml on classpath
+        this.engine = DefaultEngine.create(hadoopConf);      // default file / parquet / json handlers
+    }
+
+    public List<Object[]> readDeltaTable(String tablePath) {
+        // e.g. tablePath = "hdfs://namenode:8020/path/to/delta/table"
+        Table table = Table.forPath(engine, tablePath);      // Kernel table object
+
+        Snapshot snapshot = table.getLatestSnapshot(engine); // latest version
+
+        // Build scan (no filter, all columns)
+        ScanBuilder scanBuilder = snapshot.getScanBuilder(engine);
+        Scan scan = scanBuilder.build();
+
+        List<Object[]> rows = new ArrayList<>();
+
+        // Iterate files as columnar batches
+        scan.getScanFiles(engine).forEachRemaining(filteredBatch -> {
+            ColumnarBatch dataBatch = filteredBatch.getData();
+            int rowCount = dataBatch.getSize();
+            int colCount = dataBatch.getSchema().size();
+
+            for (int i = 0; i < rowCount; i++) {
+                Object[] row = new Object[colCount];
+                for (int c = 0; c < colCount; c++) {
+                    row[c] = dataBatch.getColumnVector(c).getObject(i);
+                }
+                rows.add(row);
+            }
+        });
+
+        return rows;
+    }
+}
