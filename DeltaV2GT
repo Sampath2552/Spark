@@ -1,0 +1,89 @@
+package com.fincore.reportstructureservice.service;
+
+import io.delta.kernel.DeltaLog;
+import io.delta.kernel.Snapshot;
+import io.delta.kernel.Scan;
+import io.delta.kernel.ScanConfig;
+import io.delta.kernel.actions.AddFile;
+import io.delta.kernel.actions.FileAction;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+
+import org.apache.parquet.example.data.Group;
+import org.apache.parquet.hadoop.ParquetReader;
+import org.apache.parquet.hadoop.example.GroupReadSupport;
+
+import org.springframework.stereotype.Service;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Service
+public class DeltaLakeService {
+
+    private final Configuration hadoopConf;
+
+    public DeltaLakeService() {
+        this.hadoopConf = new Configuration();
+        // core-site.xml & hdfs-site.xml loaded from classpath
+    }
+
+    public List<Group> readDeltaTable(String tablePath) throws IOException {
+
+        // 1️⃣ Delta table path
+        Path deltaTablePath = new Path(tablePath);
+
+        // 2️⃣ Load Delta Log
+        DeltaLog deltaLog = DeltaLog.forTable(hadoopConf, deltaTablePath);
+
+        // 3️⃣ Latest snapshot
+        Snapshot snapshot = deltaLog.snapshot();
+
+        // 4️⃣ Scan configuration
+        Scan scan = snapshot.scan(
+                ScanConfig.builder()
+                        .withReadSchema(snapshot.getMetadata().getSchema())
+                        .build()
+        );
+
+        // 5️⃣ Get file actions
+        List<FileAction> fileActions = scan.getAllFiles();
+
+        // 6️⃣ Read parquet files
+        return fileActions.stream()
+                .filter(FileAction::isAddFile)
+                .map(AddFile.class::cast)
+                .flatMap(addFile -> readParquetFile(addFile.path()))
+                .collect(Collectors.toList());
+    }
+
+    private java.util.stream.Stream<Group> readParquetFile(String parquetFilePath) {
+
+        try {
+            Path parquetPath = new Path(parquetFilePath);
+
+            ParquetReader<Group> reader =
+                    ParquetReader.builder(new GroupReadSupport(), parquetPath)
+                            .withConf(hadoopConf)
+                            .build();
+
+            return java.util.stream.Stream.generate(() -> {
+                try {
+                    return reader.read();
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            }).takeWhile(row -> row != null)
+              .onClose(() -> {
+                  try {
+                      reader.close();
+                  } catch (IOException ignored) {}
+              });
+
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to read parquet file: " + parquetFilePath, e);
+        }
+    }
+}
