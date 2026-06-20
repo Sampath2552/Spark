@@ -1,0 +1,194 @@
+package com.fincore.process_status_service.service;
+import com.fincore.commonutilities.buisnessobject.ControlDateService;
+import com.fincore.commonutilities.buisnessobject.ControlDatesDto;
+import com.fincore.process_status_service.dto.ComparisonResponseDTO;
+import com.fincore.process_status_service.dto.ControlMatchInfo;
+import com.fincore.process_status_service.dto.FileSummaryDTO;
+import com.fincore.process_status_service.model.FileType;
+import com.fincore.process_status_service.repository.FileSummaryRepository;
+import com.fincore.process_status_service.repository.FileTypeRepository;
+import com.fincore.process_status_service.util.Constants;
+import com.jcraft.jsch.ChannelSftp;
+import com.jcraft.jsch.JSch;
+import com.jcraft.jsch.Session;
+import com.jcraft.jsch.SftpException;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.common.errors.ResourceNotFoundException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.data.domain.Sort;
+import org.springframework.stereotype.Service;
+
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+
+public class FileServiceImpl  implements FileService{
+
+
+
+    private final FileTypeRepository fileTypeRepository;
+
+    private final ControlDateService controlDateService;
+
+    private final  FileSummaryRepository fileSummaryRepository;
+
+    @Value("${sftp.hostname}")
+    private String hostname;
+
+    @Value("${sftp.username}")
+    private String username;
+
+    @Value("${sftp.password}")
+    private String password;
+
+    @Value("${sftp.port}")
+    private String port;
+
+    @Override
+    public List<FileType> getFileTypes( ) {
+    return fileTypeRepository.findAll(Sort.by("type").and(Sort.by("stream").descending()));
+    }
+
+    @Override
+    public List<Map<String, Object>> getFileSummary(FileSummaryDTO fileSummaryDTO) {
+        //TODO: In case of null date pick etl date
+        LocalDate date =  fileSummaryDTO.getDate();
+        if (date ==null)
+        {
+
+            ControlDatesDto fincoreDates = controlDateService.getControlDates();
+
+            date = fincoreDates.getEtlDate();
+            log.info("Using Etl Date");
+
+
+        }
+        return fileSummaryRepository.getFileSummaryByRunId(fileSummaryDTO.getSource().toUpperCase(),date);
+    }
+
+    public ControlDatesDto getFincoreDate()
+    {
+        return controlDateService.getControlDates();
+
+    }
+
+    public LocalDate getEtlDate()
+    {
+        ControlDatesDto dates = controlDateService.getControlDates();
+        return dates.getEtlDate();
+    }
+
+
+    @Cacheable(value = "comparisonFiles", key = "#type + '-' + #date.toString()")
+    public ComparisonResponseDTO getComparisonFile(LocalDate date, String type) {
+
+        log.info("Cache miss! Fetching from SFTP for {} on {}", type, date);
+        if (type == null) throw new IllegalArgumentException("Type is required");
+
+        // 1. Determine Prefix
+        String prefix = Constants.CBS.equalsIgnoreCase(type) ? "BAL_mismatched" :
+                Constants.GLIF.equalsIgnoreCase(type) ? "GLIF_mismatched" : null;
+
+        if (prefix == null) throw new IllegalArgumentException("Invalid File Type: " + type);
+
+        // 2. Build Path correctly
+        String formattedDate = date.format(DateTimeFormatter.ofPattern("ddMMyyyy"));
+        String remoteFile = String.format("/media/FinCore/control-verification/%s_%s.txt", prefix, formattedDate);
+
+        List<ControlMatchInfo> results = new ArrayList<>();
+        Session session = null;
+        ChannelSftp channelSftp = null;
+        Long malformedCount = 0L;
+        Long totalCount = 0L;
+        Long notMatched = 0L;
+        Long fileNotFound = 0L;
+
+
+
+        try {
+            JSch jsch = new JSch();
+            session = jsch.getSession(username, hostname, Integer.parseInt(port));
+            session.setPassword(password);
+            session.setConfig("StrictHostKeyChecking", "no");
+            session.connect(5000); // Add timeout
+
+            channelSftp = (ChannelSftp) session.openChannel("sftp");
+            channelSftp.connect(5000);
+
+            try (InputStream is = channelSftp.get(remoteFile);
+                 BufferedReader reader = new BufferedReader(new InputStreamReader(is))) {
+
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    totalCount++;
+                    if (line.trim().isEmpty()) continue;
+
+                    String[] parts = line.split("\\|");
+                    if (parts.length >= 4) {
+                        String status = parts[3];
+                        results.add(mapToInfo(parts));
+
+                        if (Constants.NOT_MATCHED.equalsIgnoreCase(status)) {
+                            notMatched++;
+                        } else if (Constants.FILE_NOT_FOUND.equalsIgnoreCase(status)) {
+                            fileNotFound++;
+                        }
+
+
+
+
+                    } else {
+                        malformedCount++; // Increment for bad lines
+                        log.warn("Malformed line {}: {}", totalCount, line);
+                    }
+                }
+
+            }
+        } catch (SftpException e) {
+            if (e.id == ChannelSftp.SSH_FX_NO_SUCH_FILE) {
+                log.warn("File not found on SFTP: {}", remoteFile);
+                 // Return empty list instead of crashing if file is missing
+               throw new ResourceNotFoundException( type + " Comparison File is not generated for  the  date "+date);
+
+            }
+            throw new RuntimeException("SFTP error", e);
+        } catch (Exception e) {
+            log.error("Failed to fetch file: {}", remoteFile, e);
+            throw new RuntimeException("Error processing file", e);
+        } finally {
+            if (channelSftp != null && channelSftp.isConnected()) channelSftp.disconnect();
+            if (session != null && session.isConnected()) session.disconnect();
+        }
+        return new ComparisonResponseDTO(results,malformedCount,totalCount,notMatched,fileNotFound);
+    }
+
+    // Helper to keep logic clean
+    private ControlMatchInfo mapToInfo(String[] parts) {
+        ControlMatchInfo info = new ControlMatchInfo();
+        info.setFileName(parts[0]);
+        info.setActualCount(getOrDefault(parts, 1, "-"));
+        info.setControlCount(getOrDefault(parts, 2, "-"));
+        info.setStatus(getOrDefault(parts, 3, "UNKNOWN"));
+        return info;
+    }
+
+    private String getOrDefault(String[] parts, int index, String defaultValue) {
+        return (index < parts.length && parts[index] != null && !parts[index].isBlank())
+                ? parts[index] : defaultValue;
+    }
+
+
+}
